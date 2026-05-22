@@ -20,6 +20,8 @@ interface Models {
   image: string
 }
 
+type ApiKeys = Record<Provider, string>
+
 interface Conversation {
   id: string
   title: string
@@ -45,7 +47,7 @@ const settingsOpen = ref(false)
 const settingsProvider = ref<Provider>('openai')
 const settingsApiKey = ref('')
 const settingsError = ref('')
-const savedApiKey = ref('')
+const savedApiKeys = ref<ApiKeys>({ openai: '', claude: '' })
 const titleDialogOpen = ref(false)
 const titleDraft = ref('')
 const titleError = ref('')
@@ -115,6 +117,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 const activeConversation = computed(() => conversations.value.find((item) => item.id === activeConversationId.value))
 const providerModel = computed(() => (provider.value === 'openai' ? models.value.openai : models.value.claude))
+const activeSavedApiKey = computed(() => savedApiKeys.value[settingsProvider.value] || '')
 const canGenerateImage = computed(() => configured.value && provider.value === 'openai')
 const activeConversationPending = computed(() => Boolean(activeConversationId.value && pendingConversations.value[activeConversationId.value]))
 const sendDisabled = computed(() => activeConversationPending.value || !input.value.trim() || (composerMode.value === 'image' && !canGenerateImage.value))
@@ -254,10 +257,10 @@ async function boot() {
   loading.value = true
   try {
     await ensureDeviceToken()
-    const me = await api<{ configured: boolean; provider: Provider | null; apiKey: string; macAddress: string | null; models: Models }>('/api/me')
+    const me = await api<{ configured: boolean; provider: Provider | null; apiKeys: ApiKeys; macAddress: string | null; models: Models }>('/api/me')
     configured.value = me.configured
     models.value = me.models
-    savedApiKey.value = me.apiKey || ''
+    savedApiKeys.value = { openai: me.apiKeys?.openai || '', claude: me.apiKeys?.claude || '' }
     if (me.provider) provider.value = me.provider
     statusText.value = me.configured
       ? `已绑定 ${providerName(provider.value)}，${me.macAddress ? `MAC ${me.macAddress}` : '使用设备 ID 识别'}`
@@ -307,7 +310,7 @@ async function saveSetup() {
       method: 'POST',
       body: JSON.stringify({ provider: provider.value, apiKey: apiKey.value.trim() })
     })
-    savedApiKey.value = apiKey.value.trim()
+    savedApiKeys.value = { ...savedApiKeys.value, [provider.value]: apiKey.value.trim() }
     apiKey.value = ''
     await boot()
   } catch (error) {
@@ -317,9 +320,15 @@ async function saveSetup() {
 
 function openSettings() {
   settingsProvider.value = provider.value
-  settingsApiKey.value = savedApiKey.value
+  settingsApiKey.value = savedApiKeys.value[settingsProvider.value] || ''
   settingsError.value = ''
   settingsOpen.value = true
+}
+
+function selectSettingsProvider(nextProvider: Provider) {
+  settingsProvider.value = nextProvider
+  settingsApiKey.value = savedApiKeys.value[nextProvider] || ''
+  settingsError.value = ''
 }
 
 function closeSettings() {
@@ -340,7 +349,7 @@ async function saveSettings() {
       body: JSON.stringify({ provider: settingsProvider.value, apiKey: settingsApiKey.value.trim() })
     })
     provider.value = settingsProvider.value
-    savedApiKey.value = settingsApiKey.value.trim()
+    savedApiKeys.value = { ...savedApiKeys.value, [settingsProvider.value]: settingsApiKey.value.trim() }
     closeSettings()
     await boot()
   } catch (error) {
@@ -930,7 +939,7 @@ onMounted(boot)
             type="button"
             class="rounded-xl px-4 py-3 text-sm font-semibold transition"
             :class="settingsProvider === 'openai' ? 'bg-white text-primary-700 shadow-card' : 'text-gray-500 hover:text-gray-800'"
-            @click="settingsProvider = 'openai'"
+            @click="selectSettingsProvider('openai')"
           >
             OpenAI
           </button>
@@ -938,7 +947,7 @@ onMounted(boot)
             type="button"
             class="rounded-xl px-4 py-3 text-sm font-semibold transition"
             :class="settingsProvider === 'claude' ? 'bg-white text-primary-700 shadow-card' : 'text-gray-500 hover:text-gray-800'"
-            @click="settingsProvider = 'claude'"
+            @click="selectSettingsProvider('claude')"
           >
             Claude
           </button>
@@ -948,6 +957,9 @@ onMounted(boot)
           <span class="text-sm font-medium text-gray-700">API Key</span>
           <input v-model="settingsApiKey" class="input font-mono" type="password" placeholder="粘贴新的 API Key" autocomplete="off" />
         </label>
+        <p class="mt-2 text-xs text-gray-400">
+          {{ activeSavedApiKey ? `${providerName(settingsProvider)} 已保存 Key，可直接修改后保存。` : `尚未保存 ${providerName(settingsProvider)} Key。` }}
+        </p>
 
         <p class="mt-3 min-h-5 text-sm text-red-600">{{ settingsError }}</p>
         <div class="mt-4 flex justify-end gap-2">

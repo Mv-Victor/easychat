@@ -114,7 +114,9 @@ def init_db() -> None:
                 device_id TEXT NOT NULL UNIQUE,
                 mac_address TEXT,
                 provider TEXT NOT NULL CHECK(provider IN ('openai', 'claude')),
-                api_key TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                openai_api_key TEXT NOT NULL DEFAULT '',
+                claude_api_key TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -141,6 +143,25 @@ def init_db() -> None:
             );
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "openai_api_key" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN openai_api_key TEXT NOT NULL DEFAULT ''")
+        if "claude_api_key" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN claude_api_key TEXT NOT NULL DEFAULT ''")
+        if "api_key" in columns:
+            conn.execute(
+                """
+                UPDATE users
+                SET openai_api_key = CASE
+                        WHEN provider = 'openai' AND openai_api_key = '' THEN api_key
+                        ELSE openai_api_key
+                    END,
+                    claude_api_key = CASE
+                        WHEN provider = 'claude' AND claude_api_key = '' THEN api_key
+                        ELSE claude_api_key
+                    END
+                """
+            )
 
 
 def detect_mac(ip: Optional[str]) -> Optional[str]:
@@ -173,6 +194,16 @@ def get_user(device_id: Optional[str]) -> Optional[sqlite3.Row]:
     device_id = normalize_device_id(device_id)
     with db() as conn:
         return conn.execute("SELECT * FROM users WHERE device_id=?", (device_id,)).fetchone()
+
+
+def api_keys_for_user(user: Optional[sqlite3.Row]) -> Dict[str, str]:
+    if not user:
+        return {"openai": "", "claude": ""}
+    return {"openai": user["openai_api_key"] or "", "claude": user["claude_api_key"] or ""}
+
+
+def current_api_key(user: sqlite3.Row) -> str:
+    return api_keys_for_user(user).get(user["provider"], "")
 
 
 def list_conversations(user_id: int) -> List[Dict[str, Any]]:
@@ -688,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "configured": bool(user),
                     "provider": user["provider"] if user else None,
-                    "apiKey": user["api_key"] if user else "",
+                    "apiKeys": api_keys_for_user(user),
                     "macAddress": user["mac_address"] if user else detect_mac(self.client_address[0]),
                     "models": {
                         "openai": DEFAULT_OPENAI_MODEL,
@@ -749,18 +780,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ts = now()
             mac = detect_mac(self.client_address[0])
+            openai_api_key = api_key if provider == "openai" else ""
+            claude_api_key = api_key if provider == "claude" else ""
             with db() as conn:
                 conn.execute(
                     """
-                    INSERT INTO users(device_id, mac_address, provider, api_key, created_at, updated_at)
-                    VALUES(?,?,?,?,?,?)
+                    INSERT INTO users(device_id, mac_address, provider, api_key, openai_api_key, claude_api_key, created_at, updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(device_id) DO UPDATE SET
                         mac_address=excluded.mac_address,
                         provider=excluded.provider,
                         api_key=excluded.api_key,
+                        openai_api_key=CASE
+                            WHEN excluded.provider = 'openai' THEN excluded.openai_api_key
+                            ELSE users.openai_api_key
+                        END,
+                        claude_api_key=CASE
+                            WHEN excluded.provider = 'claude' THEN excluded.claude_api_key
+                            ELSE users.claude_api_key
+                        END,
                         updated_at=excluded.updated_at
                     """,
-                    (device_id, mac, provider, api_key, ts, ts),
+                    (device_id, mac, provider, api_key, openai_api_key, claude_api_key, ts, ts),
                 )
             self.send_json({"ok": True, "provider": provider, "macAddress": mac})
             return
@@ -847,7 +888,10 @@ class Handler(BaseHTTPRequestHandler):
         chunks: List[str] = []
         try:
             history = history_for_provider(conversation_id)
-            stream = stream_openai(user["api_key"], history) if user["provider"] == "openai" else stream_claude(user["api_key"], history)
+            api_key = current_api_key(user)
+            if not api_key:
+                raise RuntimeError(f"请先配置 {user['provider']} API Key")
+            stream = stream_openai(api_key, history) if user["provider"] == "openai" else stream_claude(api_key, history)
             for chunk in stream:
                 if chunk:
                     chunks.append(chunk)
@@ -877,7 +921,11 @@ class Handler(BaseHTTPRequestHandler):
         reference_urls = save_reference_images(images)
         user_content = f"生成图片：{prompt}{image_reference_markdown(reference_urls)}"
         persist_message(conversation_id, "user", user_content)
-        image_url = generate_openai_image(user["api_key"], prompt, images, quality)
+        api_key = current_api_key(user)
+        if not api_key:
+            self.send_error_json("请先配置 OpenAI API Key", HTTPStatus.BAD_REQUEST)
+            return
+        image_url = generate_openai_image(api_key, prompt, images, quality)
         persist_message(conversation_id, "assistant", "图片已生成", image_url)
         self.send_json({"conversationId": conversation_id, "imageUrl": image_url, "referenceUrls": reference_urls})
 
