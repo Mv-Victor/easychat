@@ -688,6 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "configured": bool(user),
                     "provider": user["provider"] if user else None,
+                    "apiKey": user["api_key"] if user else "",
                     "macAddress": user["mac_address"] if user else detect_mac(self.client_address[0]),
                     "models": {
                         "openai": DEFAULT_OPENAI_MODEL,

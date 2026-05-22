@@ -45,6 +45,7 @@ const settingsOpen = ref(false)
 const settingsProvider = ref<Provider>('openai')
 const settingsApiKey = ref('')
 const settingsError = ref('')
+const savedApiKey = ref('')
 const titleDialogOpen = ref(false)
 const titleDraft = ref('')
 const titleError = ref('')
@@ -253,9 +254,10 @@ async function boot() {
   loading.value = true
   try {
     await ensureDeviceToken()
-    const me = await api<{ configured: boolean; provider: Provider | null; macAddress: string | null; models: Models }>('/api/me')
+    const me = await api<{ configured: boolean; provider: Provider | null; apiKey: string; macAddress: string | null; models: Models }>('/api/me')
     configured.value = me.configured
     models.value = me.models
+    savedApiKey.value = me.apiKey || ''
     if (me.provider) provider.value = me.provider
     statusText.value = me.configured
       ? `已绑定 ${providerName(provider.value)}，${me.macAddress ? `MAC ${me.macAddress}` : '使用设备 ID 识别'}`
@@ -305,6 +307,7 @@ async function saveSetup() {
       method: 'POST',
       body: JSON.stringify({ provider: provider.value, apiKey: apiKey.value.trim() })
     })
+    savedApiKey.value = apiKey.value.trim()
     apiKey.value = ''
     await boot()
   } catch (error) {
@@ -314,14 +317,13 @@ async function saveSetup() {
 
 function openSettings() {
   settingsProvider.value = provider.value
-  settingsApiKey.value = ''
+  settingsApiKey.value = savedApiKey.value
   settingsError.value = ''
   settingsOpen.value = true
 }
 
 function closeSettings() {
   settingsOpen.value = false
-  settingsApiKey.value = ''
   settingsError.value = ''
 }
 
@@ -338,6 +340,7 @@ async function saveSettings() {
       body: JSON.stringify({ provider: settingsProvider.value, apiKey: settingsApiKey.value.trim() })
     })
     provider.value = settingsProvider.value
+    savedApiKey.value = settingsApiKey.value.trim()
     closeSettings()
     await boot()
   } catch (error) {
