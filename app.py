@@ -81,6 +81,12 @@ def mask_secrets(text: str) -> str:
     return re.sub(r"sk-[A-Za-z0-9_-]{12,}", "sk-***", text)
 
 
+def remove_prefix(value: str, prefix: str) -> str:
+    if value.startswith(prefix):
+        return value[len(prefix):]
+    return value
+
+
 def is_valid_device_id(device_id: str) -> bool:
     return bool(re.fullmatch(r"device_[a-f0-9]{32}", device_id))
 
@@ -177,7 +183,7 @@ def detect_mac(ip: Optional[str]) -> Optional[str]:
     if not ip or ip in {"127.0.0.1", "::1", "localhost"}:
         return None
     try:
-        output = subprocess.check_output(["arp", "-n", ip], text=True, timeout=1.5)
+        output = subprocess.check_output(["arp", "-n", ip], universal_newlines=True, timeout=1.5)
     except (OSError, subprocess.SubprocessError):
         return None
     for token in output.replace("(", " ").replace(")", " ").split():
@@ -338,7 +344,7 @@ def markdown_image_urls(content: str) -> List[str]:
 
 
 def upload_url_to_base64(url: str) -> Optional[Dict[str, str]]:
-    relative = url.removeprefix("/uploads/").lstrip("/")
+    relative = remove_prefix(url, "/uploads/").lstrip("/")
     candidate = (UPLOAD_DIR / relative).resolve()
     if not UPLOAD_DIR.exists() or (UPLOAD_DIR not in candidate.parents and candidate != UPLOAD_DIR) or not candidate.is_file():
         return None
@@ -701,7 +707,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def serve_upload(self, url_path: str) -> None:
-        relative = url_path.removeprefix("/uploads/").lstrip("/")
+        relative = remove_prefix(url_path, "/uploads/").lstrip("/")
         candidate = (UPLOAD_DIR / relative).resolve()
         if not UPLOAD_DIR.exists() or (UPLOAD_DIR not in candidate.parents and candidate != UPLOAD_DIR) or not candidate.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -792,26 +798,33 @@ class Handler(BaseHTTPRequestHandler):
             openai_api_key = api_key if provider == "openai" else ""
             claude_api_key = api_key if provider == "claude" else ""
             with db() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO users(device_id, mac_address, provider, api_key, openai_api_key, claude_api_key, created_at, updated_at)
-                    VALUES(?,?,?,?,?,?,?,?)
-                    ON CONFLICT(device_id) DO UPDATE SET
-                        mac_address=excluded.mac_address,
-                        provider=excluded.provider,
-                        api_key=excluded.api_key,
-                        openai_api_key=CASE
-                            WHEN excluded.provider = 'openai' THEN excluded.openai_api_key
-                            ELSE users.openai_api_key
-                        END,
-                        claude_api_key=CASE
-                            WHEN excluded.provider = 'claude' THEN excluded.claude_api_key
-                            ELSE users.claude_api_key
-                        END,
-                        updated_at=excluded.updated_at
-                    """,
-                    (device_id, mac, provider, api_key, openai_api_key, claude_api_key, ts, ts),
-                )
+                existing = conn.execute("SELECT id FROM users WHERE device_id=?", (device_id,)).fetchone()
+                if existing and provider == "openai":
+                    conn.execute(
+                        """
+                        UPDATE users
+                        SET mac_address=?, provider=?, api_key=?, openai_api_key=?, updated_at=?
+                        WHERE device_id=?
+                        """,
+                        (mac, provider, api_key, openai_api_key, ts, device_id),
+                    )
+                elif existing:
+                    conn.execute(
+                        """
+                        UPDATE users
+                        SET mac_address=?, provider=?, api_key=?, claude_api_key=?, updated_at=?
+                        WHERE device_id=?
+                        """,
+                        (mac, provider, api_key, claude_api_key, ts, device_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO users(device_id, mac_address, provider, api_key, openai_api_key, claude_api_key, created_at, updated_at)
+                        VALUES(?,?,?,?,?,?,?,?)
+                        """,
+                        (device_id, mac, provider, api_key, openai_api_key, claude_api_key, ts, ts),
+                    )
             self.send_json({"ok": True, "provider": provider, "macAddress": mac})
             return
 
