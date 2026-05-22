@@ -1,13 +1,6 @@
-import { webcrypto } from 'crypto'
 import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
-
-// Polyfill globalThis.crypto for Node.js < 19 (CentOS 7 compatibility)
-if (!globalThis.crypto) {
-  // @ts-ignore
-  globalThis.crypto = webcrypto as Crypto
-}
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
