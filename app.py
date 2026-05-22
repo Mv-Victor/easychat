@@ -12,7 +12,16 @@ import urllib.error
 import urllib.request
 import uuid
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socketserver
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    # Python 3.6 compatibility (CentOS 7)
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):  # type: ignore
+        daemon_threads = True
+
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Union
 from urllib.parse import urlparse
