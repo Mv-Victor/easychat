@@ -143,7 +143,7 @@ function renderMarkdown(content: string) {
 
 function referenceMarkdown(images: UploadImage[]) {
   if (!images.length) return ''
-  return ['', '', '参考图：', ...images.map((image, index) => `![参考图 ${index + 1}](${image.preview})`)].join('\n')
+  return ['', '', ...images.map((image, index) => `![上传图片 ${index + 1}](${image.preview})`)].join('\n')
 }
 
 function openImagePreview(url: string) {

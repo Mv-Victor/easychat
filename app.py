@@ -310,7 +310,8 @@ def upload_url_to_base64(url: str) -> Optional[Dict[str, str]]:
 
 
 def strip_image_reference_block(content: str) -> str:
-    return re.sub(r"\n{0,2}参考图：(?:\n!\[[^\]]*\]\([^)]+\))+", "", content or "").strip()
+    without_labeled_images = re.sub(r"\n{0,2}参考图：(?:\n!\[[^\]]*\]\([^)]+\))+", "", content or "")
+    return re.sub(r"(?:\n!\[[^\]]*\]\(/uploads/[^)]+\))+", "", without_labeled_images).strip()
 
 
 def history_for_provider(conversation_id: str) -> List[Dict[str, Union[str, List[Dict[str, str]]]]]:
@@ -533,7 +534,7 @@ def save_reference_images(images: List[Dict[str, str]]) -> List[str]:
 def image_reference_markdown(urls: List[str]) -> str:
     if not urls:
         return ""
-    lines = ["", "", "参考图："]
+    lines = ["", ""]
     lines.extend(f"![参考图 {index + 1}]({url})" for index, url in enumerate(urls))
     return "\n".join(lines)
 
