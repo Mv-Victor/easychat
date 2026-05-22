@@ -33,11 +33,13 @@ http://127.0.0.1:3000
 ## 生产启动
 
 ```bash
+mkdir -p logs
 cd frontend
-npm install
-npm run build
+npm install > ../logs/npm-install.log 2>&1
+npm run build > ../logs/npm-build.log 2>&1
 cd ..
-python3 app.py
+nohup python3 app.py > logs/app.log 2>&1 &
+echo $! > logs/app.pid
 ```
 
 打开：
@@ -47,6 +49,18 @@ http://127.0.0.1:7860
 ```
 
 数据库文件默认创建在 `easychat.sqlite3`。
+
+查看后台日志：
+
+```bash
+tail -f logs/app.log
+```
+
+停止后台服务：
+
+```bash
+kill "$(cat logs/app.pid)"
+```
 
 ## 环境变量
 
