@@ -5,7 +5,6 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 
 type Provider = 'openai' | 'claude'
 type ComposerMode = 'chat' | 'image'
-type ImageQuality = 'auto' | 'low' | 'medium' | 'high'
 
 interface UploadImage {
   name: string
@@ -62,7 +61,6 @@ const messageCache = ref<Record<string, Message[]>>({})
 const pendingConversations = ref<Record<string, boolean>>({})
 const input = ref('')
 const composerMode = ref<ComposerMode>('chat')
-const imageQuality = ref<ImageQuality>('auto')
 const uploadImages = ref<UploadImage[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
 const loading = ref(false)
@@ -642,7 +640,7 @@ async function generateImage() {
     const data = await api<{ conversationId: string; imageUrl: string }>('/api/image', {
       method: 'POST',
       signal: controller.signal,
-      body: JSON.stringify({ conversationId: requestConversationId.startsWith('pending_') ? null : requestConversationId, prompt, images, quality: imageQuality.value })
+      body: JSON.stringify({ conversationId: requestConversationId.startsWith('pending_') ? null : requestConversationId, prompt, images, quality: 'high' })
     })
     if (isRequestCancelled(requestConversationId)) return
     if (requestConversationId !== data.conversationId) {
@@ -872,16 +870,6 @@ onMounted(boot)
                   生图
                 </button>
               </div>
-              <select
-                v-if="composerMode === 'image'"
-                v-model="imageQuality"
-                class="h-10 rounded-xl border border-gray-200 bg-white px-3 text-sm text-gray-700 shadow-card outline-none"
-              >
-                <option value="auto">自动画质</option>
-                <option value="low">低画质</option>
-                <option value="medium">中画质</option>
-                <option value="high">高画质</option>
-              </select>
               <button class="btn btn-secondary py-2" @click="fileInput?.click()">上传图片</button>
               <input ref="fileInput" class="hidden" type="file" accept="image/*" multiple @change="onImageUpload" />
             </div>

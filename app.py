@@ -571,10 +571,10 @@ def image_reference_markdown(urls: List[str]) -> str:
 
 
 def normalize_image_quality(value: Optional[str]) -> str:
-    return value if value in {"auto", "low", "medium", "high"} else "auto"
+    return value if value in {"auto", "low", "medium", "high"} else "high"
 
 
-def generate_openai_image(api_key: str, prompt: str, images: List[Dict[str, str]], quality: str = "auto") -> str:
+def generate_openai_image(api_key: str, prompt: str, images: List[Dict[str, str]], quality: str = "high") -> str:
     fields = {"model": DEFAULT_IMAGE_MODEL, "prompt": prompt, "size": "1024x1024", "quality": normalize_image_quality(quality)}
     if images:
         data = request_multipart(
