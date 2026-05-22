@@ -34,10 +34,6 @@ http://127.0.0.1:3000
 
 ```bash
 mkdir -p logs
-cd frontend
-npm install > ../logs/npm-install.log 2>&1
-npm run build > ../logs/npm-build.log 2>&1
-cd ..
 nohup python3 app.py > logs/app.log 2>&1 &
 echo $! > logs/app.pid
 ```
@@ -45,7 +41,7 @@ echo $! > logs/app.pid
 打开：
 
 ```text
-http://127.0.0.1:7860
+http://服务器IP:7860
 ```
 
 数据库文件默认创建在 `easychat.sqlite3`。
@@ -67,7 +63,7 @@ kill "$(cat logs/app.pid)"
 可选配置：
 
 ```bash
-EASYCHAT_HOST=127.0.0.1
+EASYCHAT_HOST=0.0.0.0
 EASYCHAT_PORT=7860
 EASYCHAT_DB=/path/to/easychat.sqlite3
 OPENAI_MODEL=gpt-5.5
