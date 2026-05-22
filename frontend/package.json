@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc -b && NODE_OPTIONS='--import ./crypto-polyfill.mjs' vite build",
+    "build": "vue-tsc -b && node build.mjs",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit"
   },
