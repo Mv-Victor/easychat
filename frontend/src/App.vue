@@ -120,7 +120,7 @@ const sendDisabled = computed(() => activeConversationPending.value || !input.va
 const inputPlaceholder = computed(() =>
   composerMode.value === 'image'
     ? '描述要生成或修改的图片，Enter 发送'
-    : '输入消息，Enter 发送，Shift+Enter 换行'
+    : '输入消息，可上传图片，Enter 发送'
 )
 
 function providerName(value: Provider) {
@@ -470,9 +470,6 @@ async function deleteConversationItem(conversationId: string) {
 
 function setComposerMode(mode: ComposerMode) {
   composerMode.value = mode
-  if (mode === 'chat') {
-    clearUploadImages()
-  }
 }
 
 function fileToUploadImage(file: File): Promise<UploadImage> {
@@ -518,7 +515,10 @@ async function sendMessage() {
   }
   const text = input.value.trim()
   if (!text || activeConversationPending.value) return
+  const pendingUploads = [...uploadImages.value]
+  const images = pendingUploads.map(({ name, type, data }) => ({ name, type, data }))
   input.value = ''
+  clearUploadImages()
   const controller = new AbortController()
   activeRequestController = controller
   let requestConversationId = activeConversationId.value || `pending_${Date.now()}`
@@ -526,7 +526,7 @@ async function sendMessage() {
   cancelledRequestIds.delete(requestConversationId)
   activeConversationId.value = requestConversationId
   setConversationPending(requestConversationId, true)
-  appendCachedMessages(requestConversationId, [{ role: 'user', content: text }, { role: 'assistant', content: '' }])
+  appendCachedMessages(requestConversationId, [{ role: 'user', content: `${text}${referenceMarkdown(pendingUploads)}` }, { role: 'assistant', content: '' }])
   await scrollToBottom()
 
   try {
@@ -537,7 +537,7 @@ async function sendMessage() {
         'X-Device-Token': await ensureDeviceToken()
       },
       signal: controller.signal,
-      body: JSON.stringify({ conversationId: requestConversationId.startsWith('pending_') ? null : requestConversationId, message: text })
+      body: JSON.stringify({ conversationId: requestConversationId.startsWith('pending_') ? null : requestConversationId, message: text, images })
     })
     if (!response.ok || !response.body) {
       const data = await response.json().catch(() => ({}))
@@ -870,11 +870,11 @@ onMounted(boot)
                 <option value="medium">中画质</option>
                 <option value="high">高画质</option>
               </select>
-              <button v-if="composerMode === 'image'" class="btn btn-secondary py-2" @click="fileInput?.click()">上传图片</button>
+              <button class="btn btn-secondary py-2" @click="fileInput?.click()">上传图片</button>
               <input ref="fileInput" class="hidden" type="file" accept="image/*" multiple @change="onImageUpload" />
             </div>
 
-            <div v-if="composerMode === 'image' && uploadImages.length" class="mb-3 flex gap-2 overflow-x-auto">
+            <div v-if="uploadImages.length" class="mb-3 flex gap-2 overflow-x-auto">
               <div v-for="(image, index) in uploadImages" :key="`${image.name}-${index}`" class="relative h-20 w-20 shrink-0 overflow-hidden rounded-2xl border border-gray-200 bg-white">
                 <img class="h-full w-full object-cover" :src="image.preview" :alt="image.name" />
                 <button class="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded-full bg-black/60 text-xs text-white" @click="removeUploadImage(index)">×</button>

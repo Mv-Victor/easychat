@@ -14,7 +14,7 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Union
 from urllib.parse import urlparse
 
 
@@ -293,12 +293,41 @@ def load_messages(conversation_id: str) -> List[Dict[str, Any]]:
     ]
 
 
-def history_for_provider(conversation_id: str) -> List[Dict[str, str]]:
-    return [
-        {"role": row["role"], "content": row["content"]}
-        for row in load_messages(conversation_id)
-        if row["role"] in {"user", "assistant"}
-    ]
+def markdown_image_urls(content: str) -> List[str]:
+    return re.findall(r"!\[[^\]]*\]\((/uploads/[^)]+)\)", content or "")
+
+
+def upload_url_to_base64(url: str) -> Optional[Dict[str, str]]:
+    relative = url.removeprefix("/uploads/").lstrip("/")
+    candidate = (UPLOAD_DIR / relative).resolve()
+    if not UPLOAD_DIR.exists() or (UPLOAD_DIR not in candidate.parents and candidate != UPLOAD_DIR) or not candidate.is_file():
+        return None
+    content_type = MIME_TYPES.get(candidate.suffix.lower(), "image/png").split(";", 1)[0]
+    return {
+        "type": content_type,
+        "data": base64.b64encode(candidate.read_bytes()).decode("ascii"),
+    }
+
+
+def strip_image_reference_block(content: str) -> str:
+    return re.sub(r"\n{0,2}参考图：(?:\n!\[[^\]]*\]\([^)]+\))+", "", content or "").strip()
+
+
+def history_for_provider(conversation_id: str) -> List[Dict[str, Union[str, List[Dict[str, str]]]]]:
+    history: List[Dict[str, Union[str, List[Dict[str, str]]]]] = []
+    for row in load_messages(conversation_id):
+        if row["role"] not in {"user", "assistant"}:
+            continue
+        image_urls = markdown_image_urls(row["content"]) if row["role"] == "user" else []
+        images = [image for image in (upload_url_to_base64(url) for url in image_urls) if image]
+        history.append(
+            {
+                "role": row["role"],
+                "content": strip_image_reference_block(row["content"]) if images else row["content"],
+                "images": images,
+            }
+        )
+    return history
 
 
 def request_json(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int = 180) -> Dict[str, Any]:
@@ -354,19 +383,23 @@ def request_multipart(url: str, headers: Dict[str, str], fields: Dict[str, str],
         raise RuntimeError("请求超时，请稍后重试") from exc
 
 
-def stream_openai(api_key: str, messages: List[Dict[str, str]]) -> Generator[str, None, None]:
+def stream_openai(api_key: str, messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]) -> Generator[str, None, None]:
+    def content_parts(msg: Dict[str, Union[str, List[Dict[str, str]]]]) -> List[Dict[str, str]]:
+        text_type = "input_text" if msg["role"] == "user" else "output_text"
+        parts = [{"type": text_type, "text": str(msg["content"])}]
+        if msg["role"] == "user":
+            for image in msg.get("images") or []:
+                if isinstance(image, dict) and image.get("data"):
+                    parts.append({"type": "input_image", "image_url": f"data:{image.get('type') or 'image/png'};base64,{image['data']}"})
+        return parts
+
     body = {
         "model": DEFAULT_OPENAI_MODEL,
         "stream": True,
         "input": [
             {
                 "role": msg["role"],
-                "content": [
-                    {
-                        "type": "input_text" if msg["role"] == "user" else "output_text",
-                        "text": msg["content"],
-                    }
-                ],
+                "content": content_parts(msg),
             }
             for msg in messages
         ],
@@ -403,13 +436,32 @@ def stream_openai(api_key: str, messages: List[Dict[str, str]]) -> Generator[str
         raise RuntimeError(mask_secrets(f"OpenAI {exc.code}: {detail}")) from exc
 
 
-def stream_claude(api_key: str, messages: List[Dict[str, str]]) -> Generator[str, None, None]:
+def stream_claude(api_key: str, messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]) -> Generator[str, None, None]:
+    def content_parts(msg: Dict[str, Union[str, List[Dict[str, str]]]]) -> Union[str, List[Dict[str, Any]]]:
+        images = msg.get("images") or []
+        if msg["role"] != "user" or not images:
+            return str(msg["content"])
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": str(msg["content"])}]
+        for image in images:
+            if isinstance(image, dict) and image.get("data"):
+                parts.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.get("type") or "image/png",
+                            "data": image["data"],
+                        },
+                    }
+                )
+        return parts
+
     body = {
         "model": DEFAULT_CLAUDE_MODEL,
         "max_tokens": 4096,
         "stream": True,
         "messages": [
-            {"role": msg["role"], "content": msg["content"]}
+            {"role": msg["role"], "content": content_parts(msg)}
             for msg in messages
             if msg["role"] in {"user", "assistant"}
         ],
@@ -769,12 +821,17 @@ class Handler(BaseHTTPRequestHandler):
     def handle_chat(self, user: sqlite3.Row) -> None:
         payload = self.read_json()
         text = (payload.get("message") or "").strip()
+        images = payload.get("images") or []
         conversation_id = payload.get("conversationId")
         if not text:
             self.send_error_json("Message is required", HTTPStatus.BAD_REQUEST)
             return
+        if not isinstance(images, list):
+            self.send_error_json("Invalid image payload", HTTPStatus.BAD_REQUEST)
+            return
         conversation_id = ensure_conversation(user, conversation_id, text)
-        persist_message(conversation_id, "user", text)
+        reference_urls = save_reference_images(images)
+        persist_message(conversation_id, "user", f"{text}{image_reference_markdown(reference_urls)}")
         self.sse_headers()
         self.sse(
             "meta",
