@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 type Provider = 'openai' | 'claude'
 type ComposerMode = 'chat' | 'image'
@@ -65,6 +65,7 @@ const uploadImages = ref<UploadImage[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
 const loading = ref(false)
 const messagesEl = ref<HTMLElement | null>(null)
+const composerTextarea = ref<HTMLTextAreaElement | null>(null)
 const previewImageUrl = ref('')
 let activeRequestController: AbortController | null = null
 let activeRequestConversationId: string | null = null
@@ -212,6 +213,17 @@ async function scrollToBottom() {
   if (messagesEl.value) {
     messagesEl.value.scrollTop = messagesEl.value.scrollHeight
   }
+}
+
+async function resizeComposer() {
+  await nextTick()
+  const textarea = composerTextarea.value
+  if (!textarea) return
+  const maxHeight = 180
+  textarea.style.height = 'auto'
+  const nextHeight = Math.min(textarea.scrollHeight, maxHeight)
+  textarea.style.height = `${nextHeight}px`
+  textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
 }
 
 function setCachedMessages(conversationId: string, nextMessages: Message[]) {
@@ -528,6 +540,7 @@ async function sendMessage() {
   const pendingUploads = [...uploadImages.value]
   const images = pendingUploads.map(({ name, type, data }) => ({ name, type, data }))
   input.value = ''
+  resizeComposer()
   clearUploadImages()
   const controller = new AbortController()
   activeRequestController = controller
@@ -623,6 +636,7 @@ async function generateImage() {
   const pendingUploads = [...uploadImages.value]
   const images = pendingUploads.map(({ name, type, data }) => ({ name, type, data }))
   input.value = ''
+  resizeComposer()
   clearUploadImages()
   const controller = new AbortController()
   activeRequestController = controller
@@ -681,6 +695,9 @@ function onComposerKeydown(event: KeyboardEvent) {
 }
 
 onMounted(boot)
+watch(input, () => {
+  resizeComposer()
+})
 </script>
 
 <template>
@@ -883,10 +900,12 @@ onMounted(boot)
 
             <div class="flex items-end gap-3">
               <textarea
+                ref="composerTextarea"
                 v-model="input"
-                class="input max-h-40 min-h-[52px] resize-none border-0 bg-white py-3 shadow-card"
+                class="input min-h-[52px] resize-none border-0 bg-white py-3 shadow-card"
                 rows="1"
                 :placeholder="inputPlaceholder"
+                @input="resizeComposer"
                 @keydown="onComposerKeydown"
               ></textarea>
               <button
