@@ -20,6 +20,14 @@ interface Models {
 }
 
 type ApiKeys = Record<Provider, string>
+type ChatModels = Record<Provider, string[]>
+type ModelTestStatus = 'unknown' | 'testing' | 'ok' | 'bad'
+
+interface ModelTestResult {
+  status: ModelTestStatus
+  message?: string
+  latencyMs?: number
+}
 
 interface Conversation {
   id: string
@@ -53,7 +61,11 @@ const titleError = ref('')
 const editingConversationId = ref<string | null>(null)
 const editingConversationTitle = ref('')
 const statusText = ref('正在检查设备配置...')
-const models = ref<Models>({ openai: 'gpt-5.5', claude: 'claude-opus-4-7', image: 'gpt-image-2' })
+const models = ref<Models>({ openai: 'gpt-5.5', claude: 'claude-sonnet-4-6', image: 'gpt-image-2' })
+const availableModels = ref<ChatModels>({ openai: ['gpt-5.5'], claude: ['claude-sonnet-4-6'] })
+const modelTests = ref<Record<Provider, Record<string, ModelTestResult>>>({ openai: {}, claude: {} })
+const modelLoading = ref(false)
+const modelError = ref('')
 const conversations = ref<Conversation[]>([])
 const activeConversationId = ref<string | null>(null)
 const messages = ref<Message[]>([])
@@ -116,10 +128,17 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 const activeConversation = computed(() => conversations.value.find((item) => item.id === activeConversationId.value))
 const providerModel = computed(() => (provider.value === 'openai' ? models.value.openai : models.value.claude))
+const chatModelOptions = computed(() => availableModels.value[provider.value] || [providerModel.value])
+const activeModelTest = computed(() => modelTests.value[provider.value]?.[providerModel.value] || { status: 'unknown' as ModelTestStatus })
 const activeSavedApiKey = computed(() => savedApiKeys.value[settingsProvider.value] || '')
 const canGenerateImage = computed(() => configured.value && provider.value === 'openai')
 const activeConversationPending = computed(() => Boolean(activeConversationId.value && pendingConversations.value[activeConversationId.value]))
-const sendDisabled = computed(() => activeConversationPending.value || !input.value.trim() || (composerMode.value === 'image' && !canGenerateImage.value))
+const sendDisabled = computed(() =>
+  activeConversationPending.value ||
+  !input.value.trim() ||
+  (composerMode.value === 'image' && !canGenerateImage.value) ||
+  (composerMode.value === 'chat' && ['testing', 'bad'].includes(activeModelTest.value.status))
+)
 const inputPlaceholder = computed(() =>
   composerMode.value === 'image'
     ? '描述要生成或修改的图片，Enter 发送'
@@ -128,6 +147,96 @@ const inputPlaceholder = computed(() =>
 
 function providerName(value: Provider) {
   return value === 'openai' ? 'OpenAI' : 'Claude'
+}
+
+function modelStorageKey(value: Provider) {
+  return `easychat_model_${value}`
+}
+
+function setProviderModel(value: Provider, model: string) {
+  const nextModel = model.trim()
+  if (!nextModel) return
+  models.value = { ...models.value, [value]: nextModel }
+  localStorage.setItem(modelStorageKey(value), nextModel)
+}
+
+function setModelTest(value: Provider, model: string, result: ModelTestResult) {
+  modelTests.value = {
+    ...modelTests.value,
+    [value]: {
+      ...modelTests.value[value],
+      [model]: result
+    }
+  }
+}
+
+function syncSelectedModel(value: Provider) {
+  const options = availableModels.value[value] || []
+  const saved = localStorage.getItem(modelStorageKey(value)) || ''
+  const current = models.value[value]
+  const next = options.includes(saved) ? saved : options.includes(current) ? current : options[0] || current
+  setProviderModel(value, next)
+}
+
+function modelStatusLabel(value: Provider, model: string) {
+  const status = modelTests.value[value]?.[model]?.status || 'unknown'
+  if (status === 'ok') return '可用'
+  if (status === 'bad') return '不可用'
+  if (status === 'testing') return '检测中'
+  return '未测'
+}
+
+function activeModelStatusText() {
+  const result = activeModelTest.value
+  if (result.status === 'ok') return `模型可用${result.latencyMs ? ` · ${Math.round(result.latencyMs / 100) / 10}s` : ''}`
+  if (result.status === 'bad') return result.message || '模型不可用'
+  if (result.status === 'testing') return '正在测试模型'
+  return '模型尚未测试'
+}
+
+async function testChatModel(value: Provider, model: string) {
+  if (!configured.value || !model || modelTests.value[value]?.[model]?.status === 'testing') return
+  setModelTest(value, model, { status: 'testing' })
+  try {
+    const data = await api<{ ok: boolean; error?: string; latencyMs?: number }>(`/api/models/test`, {
+      method: 'POST',
+      body: JSON.stringify({ provider: value, model })
+    })
+    setModelTest(value, model, data.ok ? { status: 'ok', latencyMs: data.latencyMs } : { status: 'bad', message: data.error || '模型不可用' })
+  } catch (error) {
+    setModelTest(value, model, { status: 'bad', message: error instanceof Error ? error.message : '模型测试失败' })
+  }
+}
+
+async function testProviderModels(value: Provider) {
+  await Promise.all((availableModels.value[value] || []).map((model) => testChatModel(value, model)))
+}
+
+async function selectChatModel(event: Event) {
+  const nextModel = (event.target as HTMLSelectElement).value
+  setProviderModel(provider.value, nextModel)
+  await testChatModel(provider.value, nextModel)
+}
+
+async function refreshAvailableModels() {
+  if (!configured.value) return
+  modelLoading.value = true
+  modelError.value = ''
+  try {
+    const data = await api<{ models: Partial<ChatModels>; errors?: Partial<Record<Provider, string>> }>('/api/models')
+    const openaiModels = data.models.openai?.length ? data.models.openai : [models.value.openai]
+    const claudeModels = data.models.claude?.length ? data.models.claude : [models.value.claude]
+    availableModels.value = { openai: openaiModels, claude: claudeModels }
+    syncSelectedModel('openai')
+    syncSelectedModel('claude')
+    const errors = data.errors || {}
+    modelError.value = [errors.openai && `OpenAI: ${errors.openai}`, errors.claude && `Claude: ${errors.claude}`].filter(Boolean).join('；')
+    void testProviderModels(provider.value)
+  } catch (error) {
+    modelError.value = error instanceof Error ? error.message : '模型列表刷新失败'
+  } finally {
+    modelLoading.value = false
+  }
 }
 
 function formatTime(timestamp: number) {
@@ -270,12 +379,16 @@ async function boot() {
     const me = await api<{ configured: boolean; provider: Provider | null; apiKeys: ApiKeys; macAddress: string | null; models: Models }>('/api/me')
     configured.value = me.configured
     models.value = me.models
+    availableModels.value = { openai: [me.models.openai], claude: [me.models.claude] }
     savedApiKeys.value = { openai: me.apiKeys?.openai || '', claude: me.apiKeys?.claude || '' }
     if (me.provider) provider.value = me.provider
+    syncSelectedModel('openai')
+    syncSelectedModel('claude')
     statusText.value = me.configured
       ? `已绑定 ${providerName(provider.value)}，${me.macAddress ? `MAC ${me.macAddress}` : '使用设备 ID 识别'}`
       : '请选择服务商并粘贴 API Key'
     if (configured.value) {
+      await refreshAvailableModels()
       await refreshConversations()
       if (conversations.value.length) {
         await openConversation(conversations.value[0].id)
@@ -391,7 +504,7 @@ async function openConversation(id: string) {
 async function newConversation() {
   const conversation = await api<Conversation>('/api/conversations', {
     method: 'POST',
-    body: JSON.stringify({ title: '新会话' })
+    body: JSON.stringify({ title: '新会话', model: providerModel.value })
   })
   await refreshConversations()
   activeConversationId.value = conversation.id
@@ -560,7 +673,7 @@ async function sendMessage() {
         'X-Device-Token': await ensureDeviceToken()
       },
       signal: controller.signal,
-      body: JSON.stringify({ conversationId: requestConversationId.startsWith('pending_') ? null : requestConversationId, message: text, images })
+      body: JSON.stringify({ conversationId: requestConversationId.startsWith('pending_') ? null : requestConversationId, message: text, images, model: providerModel.value })
     })
     if (!response.ok || !response.body) {
       const data = await response.json().catch(() => ({}))
@@ -869,27 +982,75 @@ watch(input, () => {
 
         <footer class="border-t border-gray-200 bg-white p-4">
           <div class="mx-auto max-w-4xl rounded-3xl border border-gray-200 bg-gray-50 p-3">
-            <div class="mb-3 flex items-center justify-between gap-3">
-              <div class="grid grid-cols-2 gap-1 rounded-2xl bg-white p-1 shadow-card">
-                <button
-                  class="rounded-xl px-4 py-2 text-sm font-semibold transition"
-                  :class="composerMode === 'chat' ? 'bg-slate-950 text-white' : 'text-gray-500 hover:text-gray-900'"
-                  @click="setComposerMode('chat')"
-                >
-                  聊天
-                </button>
-                <button
-                  class="rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40"
-                  :class="composerMode === 'image' ? 'bg-primary-600 text-white' : 'text-gray-500 hover:text-gray-900'"
-                  :disabled="!canGenerateImage"
-                  @click="setComposerMode('image')"
-                >
-                  生图
-                </button>
+            <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <div class="flex min-w-0 flex-wrap items-center gap-2">
+                <div class="grid grid-cols-2 gap-1 rounded-2xl bg-white p-1 shadow-card">
+                  <button
+                    class="rounded-xl px-4 py-2 text-sm font-semibold transition"
+                    :class="composerMode === 'chat' ? 'bg-slate-950 text-white' : 'text-gray-500 hover:text-gray-900'"
+                    @click="setComposerMode('chat')"
+                  >
+                    聊天
+                  </button>
+                  <button
+                    class="rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40"
+                    :class="composerMode === 'image' ? 'bg-primary-600 text-white' : 'text-gray-500 hover:text-gray-900'"
+                    :disabled="!canGenerateImage"
+                    @click="setComposerMode('image')"
+                  >
+                    生图
+                  </button>
+                </div>
+
+                <div v-if="composerMode === 'chat'" class="flex min-w-0 items-center gap-1 rounded-2xl bg-white p-1 shadow-card">
+                  <span class="shrink-0 px-2 text-xs font-medium text-gray-400">聊天模型</span>
+                  <select
+                    class="min-w-0 max-w-[260px] truncate rounded-xl bg-gray-100 px-3 py-2 text-sm font-medium text-gray-800 outline-none transition hover:bg-gray-200 focus:ring-2 focus:ring-primary-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                    :value="providerModel"
+                    :disabled="activeConversationPending"
+                    @change="selectChatModel"
+                  >
+                    <option v-for="model in chatModelOptions" :key="model" :value="model">
+                      {{ model }} · {{ modelStatusLabel(provider, model) }}
+                    </option>
+                  </select>
+                  <span
+                    class="shrink-0 rounded-xl px-2 py-1 text-xs font-medium"
+                    :class="{
+                      'bg-emerald-50 text-emerald-700': activeModelTest.status === 'ok',
+                      'bg-red-50 text-red-700': activeModelTest.status === 'bad',
+                      'bg-amber-50 text-amber-700': activeModelTest.status === 'testing',
+                      'bg-gray-100 text-gray-500': activeModelTest.status === 'unknown'
+                    }"
+                    :title="activeModelStatusText()"
+                  >
+                    {{ modelStatusLabel(provider, providerModel) }}
+                  </span>
+                  <button
+                    class="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-gray-500 transition hover:bg-gray-100 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-50"
+                    :class="modelLoading ? 'animate-spin' : ''"
+                    :disabled="modelLoading"
+                    title="刷新模型"
+                    @click="refreshAvailableModels"
+                  >
+                    <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                      <path d="M21 3v6h-6" />
+                    </svg>
+                  </button>
+                </div>
+                <div v-else class="flex min-w-0 items-center gap-1 rounded-2xl bg-white p-1 shadow-card">
+                  <span class="shrink-0 px-2 text-xs font-medium text-gray-400">生图模型</span>
+                  <span class="truncate rounded-xl bg-primary-50 px-3 py-2 text-sm font-medium text-primary-700">{{ models.image }}</span>
+                </div>
               </div>
               <button class="btn btn-secondary py-2" @click="fileInput?.click()">上传图片</button>
               <input ref="fileInput" class="hidden" type="file" accept="image/*" multiple @change="onImageUpload" />
             </div>
+            <p v-if="modelError" class="mb-3 truncate text-xs text-amber-600" :title="modelError">{{ modelError }}</p>
+            <p v-if="composerMode === 'chat' && activeModelTest.status !== 'unknown'" class="mb-3 truncate text-xs text-gray-500" :title="activeModelStatusText()">
+              {{ activeModelStatusText() }}
+            </p>
 
             <div v-if="uploadImages.length" class="mb-3 flex gap-2 overflow-x-auto">
               <div v-for="(image, index) in uploadImages" :key="`${image.name}-${index}`" class="relative h-20 w-20 shrink-0 overflow-hidden rounded-2xl border border-gray-200 bg-white">

@@ -34,13 +34,15 @@ DB_PATH = Path(os.environ.get("EASYCHAT_DB", ROOT / "easychat.sqlite3"))
 HOST = os.environ.get("EASYCHAT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EASYCHAT_PORT", "7860"))
 DEFAULT_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
-DEFAULT_CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+CLAUDE_STABLE_MODELS = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"]
+DEFAULT_CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", CLAUDE_STABLE_MODELS[0])
 DEFAULT_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://tkcc.cloud").rstrip("/")
 CLAUDE_BASE_URL = os.environ.get("CLAUDE_BASE_URL", "https://tkcc.cloud").rstrip("/")
 DEVICE_TOKEN_SECRET = os.environ.get("EASYCHAT_DEVICE_TOKEN_SECRET", "easychat-dev-secret-change-me")
 IMAGE_REQUEST_TIMEOUT = int(os.environ.get("OPENAI_IMAGE_TIMEOUT", "600"))
 MAX_UPLOAD_IMAGE_BYTES = int(os.environ.get("EASYCHAT_MAX_UPLOAD_IMAGE_BYTES", str(8 * 1024 * 1024)))
+MAX_MODEL_ID_LENGTH = 120
 
 
 MIME_TYPES = {
@@ -221,6 +223,67 @@ def current_api_key(user: sqlite3.Row) -> str:
     return api_keys_for_user(user).get(user["provider"], "")
 
 
+def default_model_for_provider(provider: str) -> str:
+    return DEFAULT_OPENAI_MODEL if provider == "openai" else DEFAULT_CLAUDE_MODEL
+
+
+def normalize_model_id(model: Any) -> str:
+    if not isinstance(model, str):
+        return ""
+    model = model.strip()
+    if not model or len(model) > MAX_MODEL_ID_LENGTH:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9._:/+=-]+", model):
+        return ""
+    return model
+
+
+def selected_model_for_provider(provider: str, model: Any = None) -> str:
+    return normalize_model_id(model) or default_model_for_provider(provider)
+
+
+def unique_model_ids(models: List[str], fallback: str) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for model in [fallback, *models]:
+        normalized = normalize_model_id(model)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result or [fallback]
+
+
+def is_chat_model_id(provider: str, model: str) -> bool:
+    normalized = model.lower()
+    if provider == "claude":
+        return normalized in CLAUDE_STABLE_MODELS
+    excluded_terms = {
+        "audio",
+        "babbage",
+        "codex",
+        "dall-e",
+        "davinci",
+        "edit",
+        "embedding",
+        "image",
+        "moderation",
+        "realtime",
+        "search",
+        "speech",
+        "tts",
+        "transcribe",
+        "translation",
+        "whisper",
+    }
+    if any(term in normalized for term in excluded_terms):
+        return False
+    return normalized.startswith(("chatgpt-", "gpt-", "o1", "o3", "o4"))
+
+
+def chat_model_ids(provider: str, models: List[str], fallback: str) -> List[str]:
+    return unique_model_ids([model for model in models if is_chat_model_id(provider, model)], fallback)
+
+
 def list_conversations(user_id: int) -> List[Dict[str, Any]]:
     with db() as conn:
         rows = conn.execute(
@@ -245,8 +308,8 @@ def list_conversations(user_id: int) -> List[Dict[str, Any]]:
     ]
 
 
-def create_conversation(user_id: int, provider: str, title: str) -> str:
-    model = DEFAULT_OPENAI_MODEL if provider == "openai" else DEFAULT_CLAUDE_MODEL
+def create_conversation(user_id: int, provider: str, title: str, model: Optional[str] = None) -> str:
+    model = selected_model_for_provider(provider, model)
     conversation_id = make_id("chat")
     ts = now()
     with db() as conn:
@@ -299,7 +362,9 @@ def delete_conversation(user_id: int, conversation_id: str) -> bool:
     return cursor.rowcount > 0
 
 
-def ensure_conversation(user: sqlite3.Row, conversation_id: Optional[str], first_message: str) -> str:
+def ensure_conversation(user: sqlite3.Row, conversation_id: Optional[str], first_message: str, model: Optional[str] = None) -> str:
+    provider = user["provider"]
+    selected_model = selected_model_for_provider(provider, model)
     if conversation_id:
         with db() as conn:
             found = conn.execute(
@@ -307,8 +372,13 @@ def ensure_conversation(user: sqlite3.Row, conversation_id: Optional[str], first
                 (conversation_id, user["id"]),
             ).fetchone()
         if found:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE conversations SET provider=?, model=? WHERE id=? AND user_id=?",
+                    (provider, selected_model, conversation_id, user["id"]),
+                )
             return conversation_id
-    return create_conversation(user["id"], user["provider"], title_from_prompt(first_message))
+    return create_conversation(user["id"], provider, title_from_prompt(first_message), selected_model)
 
 
 def persist_message(conversation_id: str, role: str, content: str, image_url: Optional[str] = None) -> None:
@@ -394,6 +464,82 @@ def request_json(url: str, headers: Dict[str, str], body: Dict[str, Any], timeou
         raise RuntimeError("请求超时，请稍后重试") from exc
 
 
+def request_json_get(url: str, headers: Dict[str, str], timeout: int = 20) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        headers={"Content-Type": "application/json", **headers},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(mask_secrets(f"{exc.code} {exc.reason}: {detail}")) from exc
+    except TimeoutError as exc:
+        raise RuntimeError("模型列表请求超时") from exc
+
+
+def model_ids_from_response(data: Dict[str, Any]) -> List[str]:
+    items = data.get("data") or data.get("models") or []
+    if not isinstance(items, list):
+        return []
+    ids: List[str] = []
+    for item in items:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict):
+            ids.append(str(item.get("id") or item.get("name") or ""))
+    return ids
+
+
+def list_provider_models(provider: str, api_key: str) -> List[str]:
+    fallback = default_model_for_provider(provider)
+    if not api_key:
+        return [fallback]
+    if provider == "openai":
+        data = request_json_get(
+            f"{OPENAI_BASE_URL}/v1/models",
+            {"Authorization": f"Bearer {api_key}"},
+        )
+    else:
+        data = request_json_get(
+            f"{CLAUDE_BASE_URL}/v1/models",
+            {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        )
+    return chat_model_ids(provider, model_ids_from_response(data), fallback)
+
+
+def test_provider_model(provider: str, api_key: str, model: str) -> Dict[str, Any]:
+    selected_model = selected_model_for_provider(provider, model)
+    if not api_key:
+        raise RuntimeError(f"请先配置 {provider} API Key")
+    started = time.time()
+    if provider == "openai":
+        request_json(
+            f"{OPENAI_BASE_URL}/v1/responses",
+            {"Authorization": f"Bearer {api_key}"},
+            {
+                "model": selected_model,
+                "input": "Reply with exactly OK.",
+                "max_output_tokens": 16,
+            },
+            timeout=45,
+        )
+    else:
+        request_json(
+            f"{CLAUDE_BASE_URL}/v1/messages",
+            {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            {
+                "model": selected_model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+            },
+            timeout=45,
+        )
+    return {"ok": True, "latencyMs": int((time.time() - started) * 1000), "model": selected_model}
+
+
 def request_multipart(url: str, headers: Dict[str, str], fields: Dict[str, str], files: List[Dict[str, str]], timeout: int = 180) -> Dict[str, Any]:
     boundary = f"----EasyChatBoundary{uuid.uuid4().hex}"
     body = bytearray()
@@ -430,7 +576,7 @@ def request_multipart(url: str, headers: Dict[str, str], fields: Dict[str, str],
         raise RuntimeError("请求超时，请稍后重试") from exc
 
 
-def stream_openai(api_key: str, messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]) -> Generator[str, None, None]:
+def stream_openai(api_key: str, model: str, messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]) -> Generator[str, None, None]:
     def content_parts(msg: Dict[str, Union[str, List[Dict[str, str]]]]) -> List[Dict[str, str]]:
         text_type = "input_text" if msg["role"] == "user" else "output_text"
         parts = [{"type": text_type, "text": str(msg["content"])}]
@@ -441,7 +587,7 @@ def stream_openai(api_key: str, messages: List[Dict[str, Union[str, List[Dict[st
         return parts
 
     body = {
-        "model": DEFAULT_OPENAI_MODEL,
+        "model": selected_model_for_provider("openai", model),
         "stream": True,
         "input": [
             {
@@ -483,7 +629,7 @@ def stream_openai(api_key: str, messages: List[Dict[str, Union[str, List[Dict[st
         raise RuntimeError(mask_secrets(f"OpenAI {exc.code}: {detail}")) from exc
 
 
-def stream_claude(api_key: str, messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]) -> Generator[str, None, None]:
+def stream_claude(api_key: str, model: str, messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]) -> Generator[str, None, None]:
     def content_parts(msg: Dict[str, Union[str, List[Dict[str, str]]]]) -> Union[str, List[Dict[str, Any]]]:
         images = msg.get("images") or []
         if msg["role"] != "user" or not images:
@@ -504,46 +650,30 @@ def stream_claude(api_key: str, messages: List[Dict[str, Union[str, List[Dict[st
         return parts
 
     body = {
-        "model": DEFAULT_CLAUDE_MODEL,
+        "model": selected_model_for_provider("claude", model),
         "max_tokens": 4096,
-        "stream": True,
         "messages": [
             {"role": msg["role"], "content": content_parts(msg)}
             for msg in messages
             if msg["role"] in {"user", "assistant"}
         ],
     }
-    req = urllib.request.Request(
+    data = request_json(
         f"{CLAUDE_BASE_URL}/v1/messages",
-        data=json_dumps(body),
-        headers={
+        {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
         },
-        method="POST",
+        body,
+        timeout=180,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data: "):
-                    continue
-                try:
-                    event = json.loads(line[6:])
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "content_block_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        yield delta.get("text", "")
-                elif event.get("type") == "message_stop":
-                    break
-                elif event.get("type") == "error":
-                    raise RuntimeError(event.get("error", {}).get("message") or "Claude request failed")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(mask_secrets(f"Claude {exc.code}: {detail}")) from exc
+    chunks: List[str] = []
+    for item in data.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            chunks.append(item.get("text") or "")
+    text = "".join(chunks)
+    if text:
+        yield text
 
 
 def image_from_response(data: Dict[str, Any]) -> str:
@@ -753,6 +883,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"conversations": list_conversations(user["id"])})
             return
 
+        if path == "/api/models":
+            keys = api_keys_for_user(user)
+            result: Dict[str, List[str]] = {}
+            errors: Dict[str, str] = {}
+            for provider in ("openai", "claude"):
+                try:
+                    result[provider] = list_provider_models(provider, keys.get(provider, ""))
+                except Exception as exc:
+                    result[provider] = [default_model_for_provider(provider)]
+                    errors[provider] = mask_secrets(str(exc))
+            self.send_json({"models": result, "errors": errors})
+            return
+
         if path.startswith("/api/conversations/"):
             conversation_id = path.rsplit("/", 1)[-1]
             with db() as conn:
@@ -835,7 +978,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/conversations":
             payload = self.read_json()
             title = (payload.get("title") or "新会话").strip()[:80]
-            conversation_id = create_conversation(user["id"], user["provider"], title)
+            conversation_id = create_conversation(user["id"], user["provider"], title, payload.get("model"))
             conversations = list_conversations(user["id"])
             current = next(item for item in conversations if item["id"] == conversation_id)
             self.send_json(current)
@@ -863,6 +1006,19 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_chat(user)
             return
 
+        if path == "/api/models/test":
+            payload = self.read_json()
+            provider = (payload.get("provider") or user["provider"]).lower()
+            model = selected_model_for_provider(provider, payload.get("model"))
+            if provider not in {"openai", "claude"}:
+                self.send_error_json("Provider must be openai or claude", HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                self.send_json(test_provider_model(provider, api_keys_for_user(user).get(provider, ""), model))
+            except Exception as exc:
+                self.send_json({"ok": False, "model": model, "error": mask_secrets(str(exc))})
+            return
+
         if path == "/api/image":
             self.handle_image(user)
             return
@@ -888,13 +1044,14 @@ class Handler(BaseHTTPRequestHandler):
         text = (payload.get("message") or "").strip()
         images = payload.get("images") or []
         conversation_id = payload.get("conversationId")
+        model = selected_model_for_provider(user["provider"], payload.get("model"))
         if not text:
             self.send_error_json("Message is required", HTTPStatus.BAD_REQUEST)
             return
         if not isinstance(images, list):
             self.send_error_json("Invalid image payload", HTTPStatus.BAD_REQUEST)
             return
-        conversation_id = ensure_conversation(user, conversation_id, text)
+        conversation_id = ensure_conversation(user, conversation_id, text, model)
         reference_urls = save_reference_images(images)
         persist_message(conversation_id, "user", f"{text}{image_reference_markdown(reference_urls)}")
         self.sse_headers()
@@ -903,7 +1060,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "conversationId": conversation_id,
                 "provider": user["provider"],
-                "model": DEFAULT_OPENAI_MODEL if user["provider"] == "openai" else DEFAULT_CLAUDE_MODEL,
+                "model": model,
                 "title": title_from_prompt(text),
             },
         )
@@ -913,7 +1070,7 @@ class Handler(BaseHTTPRequestHandler):
             api_key = current_api_key(user)
             if not api_key:
                 raise RuntimeError(f"请先配置 {user['provider']} API Key")
-            stream = stream_openai(api_key, history) if user["provider"] == "openai" else stream_claude(api_key, history)
+            stream = stream_openai(api_key, model, history) if user["provider"] == "openai" else stream_claude(api_key, model, history)
             for chunk in stream:
                 if chunk:
                     chunks.append(chunk)
